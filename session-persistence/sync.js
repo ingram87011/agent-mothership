@@ -148,8 +148,14 @@ function pushToGitHub(state) {
       return;
     }
     
-    // Stash any changes first
-    run('git stash --include-untracked');
+    // Only stash if there are actual uncommitted changes
+    const hasChanges = execSync('git status --porcelain 2>/dev/null', { encoding: 'utf8' }).trim().length > 0;
+    
+    if (hasChanges) {
+      execSync('git stash push --include-untracked --message "session-sync-autostash" 2>/dev/null', { encoding: 'utf8' });
+    }
+    
+    const originalBranch = state.gitBranch || execSync('git rev-parse --abbrev-ref HEAD 2>/dev/null', { encoding: 'utf8' }).trim() || 'main';
     
     // Create or checkout sessions branch
     try {
@@ -170,7 +176,7 @@ function pushToGitHub(state) {
     try {
       execSync(`git commit -m "💾 Session save: ${state.timestamp}"`, { encoding: 'utf8' });
     } catch (e) {
-      // No changes to commit
+      // No changes to commit — that's fine
     }
     
     // Push
@@ -181,15 +187,17 @@ function pushToGitHub(state) {
       log('⚠️  Could not push to GitHub. Check your remote configuration.');
     }
     
-    // Return to main branch
+    // Return to original branch
     try {
-      execSync(`git checkout ${state.gitBranch || 'main'} 2>/dev/null`, { encoding: 'utf8' });
+      execSync(`git checkout ${originalBranch} 2>/dev/null`, { encoding: 'utf8' });
     } catch (e) {
       execSync('git checkout main 2>/dev/null || git checkout master 2>/dev/null', { encoding: 'utf8' });
     }
     
-    // Restore stashed changes
-    run('git stash pop 2>/dev/null');
+    // Only pop stash if we actually stashed something
+    if (hasChanges) {
+      execSync('git stash pop 2>/dev/null', { encoding: 'utf8' });
+    }
     
   } catch (e) {
     log(`⚠️  GitHub push failed: ${e.message}`);
