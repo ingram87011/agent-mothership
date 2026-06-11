@@ -2,3 +2,8 @@
 # yarn lockfile v1
 
 
+"freebuff@file:../../usr/local/share/npm-global/lib/node_modules/freebuff":
+  version "0.0.106"
+  resolved "file:../../usr/local/share/npm-global/lib/node_modules/freebuff"
+  dependencies:
+    tar "^7.0.0"
