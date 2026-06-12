@@ -78,7 +78,11 @@ if [ -f "${PROJECT_DIR}/web-terminal/package.json" ]; then
     cd "${PROJECT_DIR}"
 fi
 
-# 5. Print instructions
+# 5. Load memory tree
+info "Loading memory tree..."
+source "${PROJECT_DIR}/scripts/load-memory.sh" 2>/dev/null || true
+
+# 6. Print instructions
 echo ""
 echo "╔════════════════════════════════════════════════════╗"
 echo "║     🚀  READY TO GO!                              ║"

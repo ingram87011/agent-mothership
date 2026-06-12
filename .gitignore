@@ -1,6 +1,10 @@
 node_modules/
 *.log
 .env
+.env.memory
+.env.local
+node_modules/
+*.log
 .session/
 tmp/
 dist/
