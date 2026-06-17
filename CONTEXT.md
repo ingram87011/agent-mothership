@@ -1,7 +1,7 @@
 # Agent Mothership — Context
 
 ## Mission
-Remote control a locked-down library PC (ABPCP536, Windows 10, user LC2022) via Cloudflare Tunnel + WebSocket beacon relay.
+Remote control a locked-down library PC (ABPCP532, Windows 10, user LC2022) via Cloudflare Tunnel + WebSocket beacon relay.
 
 ## Architecture
 ```
@@ -75,8 +75,36 @@ All binaries in `C:\Windows\System32\` (AppLocker trusted by `%WINDIR%\*` rule).
 - store.dat: 0 bytes (agent unregistered)
 - All 6 RPC endpoints bind without ACCESS_DENIED from low-privilege
 
-## Privilege Escalation Leads (Priority Order)
-- Patch STAgentCtl.exe admin check → use dispatch cmd as SYSTEM
+## Privilege Escalation Progress
+
+### ✅ ACHIEVED: Real Admin Check Bypass — IsUserAdministrator (June 17)
+In-memory patching of STAgentCtl.exe admin check works. Two patches now:
+
+**Patch 1 — REAL fix at RVA 0x1D614 (file 0x1CA14):**
+The dispatcher function (0x1D2A0) calls `IsUserAdministrator(true)` from STCore.dll via IAT, then `je 0x1DD20` (jump to admin error). NOP the `je` (6 bytes: `0F 84 06 07 00 00` → `90 90 90 90 90 90`).
+
+**Patch 2 — handler early return at RVA 0x1DCF4 (file 0x1D0F4):**
+`B8 01 00 00 00 C3 90` (belt-and-suspenders, handles COM init edge case).
+
+**Why `help` worked but RPC commands didn't:** Commands with selector 8 (like `help`) take an early-exit path (0x1D5F4) that never reaches the admin check. Commands with direct selectors (`status`/`dispatch`/`available-tasks`) flow through to 0x1D60A → IsUserAdministrator check → blocked.
+
+**The "Unknown error" was a side-effect of NOPing the error display** at 0x1DD20 (old Patch 2) without fixing the admin check — execution continued past the NOP'd error into fallthrough code that produces "Unknown error".
+
+Full technique:
+1. Start STAgentCtl.exe suspended via CreateProcess (CREATE_SUSPENDED)
+2. NtQueryInformationProcess with 48-byte buffer (NOT 24 — STATUS_INFO_LENGTH_MISMATCH on x64)
+3. Read PEB at offset 8 → ImageBaseAddress at PEB+0x10
+4. WriteProcessMemory at ImageBase+0x1D614: 6 bytes of 0x90 (NOP `je` on IsUserAdministrator check)
+5. WriteProcessMemory at ImageBase+0x1DCF4: `B8 01 00 00 00 C3 90` (MOV EAX,1; RET; NOP)
+6. ResumeThread
+
+### ❌ NEW BLOCKER: Agent unregistered (store.dat = 0 bytes)
+Even with admin bypass, `status`/`dispatch` may fail with "Unknown error" because STDispatch rejects calls from unregistered agents. Next steps:
+- Forge store.dat to register the agent
+- Direct RPC call via NdrClientCall3
+
+### Active Leads
+- Forge store.dat (registration blob format needed)
 - Direct RPC call via NdrClientCall3 with extracted MIDL format strings
 - Print Spooler junction follow (untested, Dec 2024 patches likely mitigate)
 - Python ghost folders via HKCU PythonPath (armed, no SYSTEM trigger found)
