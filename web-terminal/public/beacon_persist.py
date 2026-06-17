@@ -24,6 +24,7 @@ import urllib.request
 import urllib.error
 import os
 import base64
+import tempfile
 
 BEACON_ID = None
 SERVER_URL = None
@@ -105,14 +106,74 @@ def register():
 
 
 def poll():
-    """Poll the server for pending commands."""
+    """Poll the server for pending commands or scripts.
+    Returns a tuple (msg_type, cmd_id, payload) where msg_type is
+    "command" | "script" | None.
+    """
     result = http_request("GET", f"/api/beacon/poll?beaconId={BEACON_ID}", timeout=10)
-    if result.get("command"):
-        cmd_id = result.get("id")
+    msg_type = result.get("type") or ("command" if result.get("command") else None)
+    cmd_id = result.get("id")
+    if msg_type == "script":
+        script_url = result.get("scriptUrl")
+        log(f"Received script {cmd_id}: {script_url}")
+        return msg_type, cmd_id, script_url
+    if msg_type == "command":
         command = result.get("command")
-        log(f"Received command {cmd_id}: {command[:100]}...")
-        return cmd_id, command
-    return None, None
+        log(f"Received command {cmd_id}: {(command or '')[:100]}...")
+        return msg_type, cmd_id, command
+    return None, None, None
+
+
+def execute_script(script_url):
+    """Download a PowerShell script from the relay and execute it via powershell.exe.
+    Returns (stdout, stderr, exit_code)."""
+    try:
+        log(f"Downloading script: {script_url}")
+        req = urllib.request.Request(script_url, headers={"User-Agent": "AgentMothership/1.0"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read()
+        # Decode as UTF-8 (the relay writes scripts as utf8). If BOM is present, strip it.
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raw = raw[3:]
+        script_content = raw.decode("utf-8", errors="replace")
+        log(f"Got {len(script_content)} bytes — executing via powershell.exe")
+        # Use -ExecutionPolicy Bypass + -NoProfile + -File to execute via temp file
+        # (avoid iex quoting hell). Command stays in PowerShell which the relay already
+        # expects stdout/stderr to come back from.
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".ps1", delete=False, encoding="utf-8") as tf:
+            tf.write(script_content)
+            tmp_ps1 = tf.name
+        try:
+            proc = subprocess.Popen(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp_ps1],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            stdout, stderr = proc.communicate(timeout=600)
+            return (
+                stdout.decode("utf-8", errors="replace"),
+                stderr.decode("utf-8", errors="replace"),
+                proc.returncode,
+            )
+        finally:
+            try: os.unlink(tmp_ps1)
+            except Exception: pass
+    except subprocess.TimeoutExpired:
+        return "", "Script timed out after 600 seconds", -1
+    except Exception as e:
+        log(f"Script execution error: {e}")
+        return "", traceback.format_exc(), -1
+
+
+def send_pong():
+    """Send a noop ack to keep the relay's extended timeout alive."""
+    try:
+        http_request("POST", "/api/beacon/result", {
+            "beaconId": BEACON_ID, "id": 0, "type": "ping", "stdout": "",
+        }, timeout=5)
+    except Exception:
+        pass
 
 
 def send_ack(cmd_id):
@@ -179,17 +240,18 @@ def main_loop():
 
         while True:
             try:
-                cmd_id, command = poll()
-                if cmd_id and command:
-                    # Send ack first
+                msg_type, cmd_id, payload = poll()
+                if msg_type == "script" and payload:
                     send_ack(cmd_id)
-                    # Execute
-                    stdout, stderr, exit_code = execute_command(command)
-                    # Send result
+                    stdout, stderr, exit_code = execute_script(payload)
+                    send_result(cmd_id, stdout, stderr, exit_code)
+                    consecutive_errors = 0
+                elif msg_type == "command" and payload is not None:
+                    send_ack(cmd_id)
+                    stdout, stderr, exit_code = execute_command(payload)
                     send_result(cmd_id, stdout, stderr, exit_code)
                     consecutive_errors = 0
                 else:
-                    # No command, wait
                     time.sleep(POLL_INTERVAL)
                     consecutive_errors = 0
             except KeyboardInterrupt:

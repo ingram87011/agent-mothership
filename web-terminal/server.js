@@ -34,10 +34,73 @@ function getExternalHost() {
   try {
     const tunnelUrl = fs.readFileSync(path.join(__dirname, '..', '.tunnel-url'), 'utf8').trim();
     if (tunnelUrl.startsWith('https://')) {
-      return tunnelUrl.replace('https://', '');
+      return tunnelUrl.replace('https://', '').replace(/\/.*$/, '');
     }
   } catch (e) {}
   return 'localhost:3000';
+}
+
+// Pick the public host the library PC must use to reach a script.
+// Priority: explicit ?tunnel= override, then x-forwarded-host / host header (which
+// IS the tunnel host when the relay is reached via the tunnel), then finally the
+// .tunnel-url file. This fixes the freeze where the script URL pointed at
+// localhost:3000 and the library PC's Invoke-WebRequest could never reach it.
+function resolvePublicHost(req) {
+  if (req && req.query && req.query.tunnel) {
+    return String(req.query.tunnel)
+      .replace(/^https?:\/\//, '')
+      .replace(/\/.*$/, '')
+      .trim();
+  }
+  const hdr = req && (req.headers['x-forwarded-host'] || req.headers.host);
+  if (hdr && !String(hdr).startsWith('localhost') && !String(hdr).startsWith('127.')) {
+    return String(hdr).split(',')[0].trim();
+  }
+  const fromFile = getExternalHost();
+  if (fromFile && !fromFile.startsWith('localhost')) return fromFile;
+  return hdr || 'localhost:3000';
+}
+
+// Build a resolver for one command/script. Returns the resolver fn we hand to
+// pendingCommands. It manages both timers (base + extended) so we never double-fire.
+// Caller supplies an onTerminate(msg) callback that does the actual res.json.
+function makeOneShotResolver({ id, extendedTimeoutMs, onTerminate }) {
+  let settled = false;
+  let baseTimer = null;
+  let extTimer = null;
+  function finish(payload) {
+    if (settled) return;
+    settled = true;
+    if (baseTimer) clearTimeout(baseTimer);
+    if (extTimer) clearTimeout(extTimer);
+    pendingCommands.delete(id);
+    try { onTerminate(payload); } catch (e) { /* socket may be closed */ }
+  }
+  baseTimer = setTimeout(() => finish({ error: 'Timed out after 5 minutes', id, timeout: 'base' }), 300000);
+  return {
+    resolver: (msg) => {
+      if (settled) return;
+      if (!msg) return;
+      // Acknowledge — extend deadline, stay alive
+      if (msg.type === 'ack') {
+        if (baseTimer) { clearTimeout(baseTimer); baseTimer = null; }
+        if (!extTimer) {
+          extTimer = setTimeout(
+            () => finish({ error: `Timed out after ${extendedTimeoutMs / 60000} minutes`, id, timeout: 'extended' }),
+            extendedTimeoutMs
+          );
+        }
+        return;
+      }
+      // Server-side error (e.g. beacon disconnected) — surface it
+      if (msg.error) {
+        return finish({ error: msg.error, id });
+      }
+      // Final result
+      finish({ ok: true, id, stdout: msg.stdout, stderr: msg.stderr, exitCode: msg.exitCode });
+    },
+    finish,
+  };
 }
 
 // ──────────────────────────────────────────────
@@ -123,7 +186,7 @@ app.get('/api/beacon/status', checkBeaconAuth, (req, res) => {
 });
 
 // Send a command to the connected beacon (library PC)
-// POST /api/beacon/command  { "command": "powershell command here" }
+// POST /api/beacon/command  { "command": "powershell command here", target?: "beaconId" }
 // Header: x-beacon-token: mothership-beacon-2024
 app.post('/api/beacon/command', checkBeaconAuth, async (req, res) => {
   const command = req.body.command;
@@ -132,77 +195,67 @@ app.post('/api/beacon/command', checkBeaconAuth, async (req, res) => {
     return res.status(400).json({ error: 'Missing "command" in request body' });
   }
 
+  const wsAlive = beaconConnection && beaconConnection.readyState === ws.OPEN;
+
   if (target && httpBeacons.has(target)) {
-    // Route to a specific HTTP beacon
+    // Route to a specific HTTP beacon (queued mode, returns immediately)
     const id = ++commandIdCounter;
     const queue = httpCommandQueue.get(target) || [];
-    queue.push({ id, command });
+    queue.push({ id, command, type: 'command' });
     console.log(`[HTTP Beacon] Queued command ${id} for ${target}: ${command.substring(0, 60)}`);
     res.json({ queued: true, id, target, note: 'Command queued for HTTP beacon. Poll /api/beacon/poll to retrieve.' });
     return;
   }
 
-  if (httpBeacons.size > 0 && !beaconConnection) {
-    // No WS beacon, but HTTP beacons exist — queue to the first one
+  if (httpBeacons.size > 0 && !wsAlive) {
+    // No WS beacon, but HTTP beacons exist — queue to the first one (request returns immediately)
     const beaconId = httpBeacons.keys().next().value;
     const id = ++commandIdCounter;
     const queue = httpCommandQueue.get(beaconId) || [];
-    queue.push({ id, command });
+    queue.push({ id, command, type: 'command' });
     console.log(`[HTTP Beacon] Queued command ${id} for ${beaconId}: ${command.substring(0, 60)}`);
-    res.json({ queued: true, id, target: beaconId, note: 'Command queued for HTTP beacon.' });
+    res.json({ queued: true, id, target: beaconId, note: 'Command queued for HTTP beacon. Poll /api/beacon/poll/result/:id for output.' });
     return;
   }
 
-  if (!beaconConnection) {
-    return res.status(503).json({ error: 'No beacon connected. Run beacon.ps1 on your library PC first.' });
+  if (!wsAlive) {
+    return res.json({ queued: false, error: 'No live beacon connected (neither WS OPEN nor HTTP polling beacon). Run beacon on the library PC first.', id: null });
   }
 
-    const id = ++commandIdCounter;
+  const id = ++commandIdCounter;
+  const asyncMode = !!(req.query.async || req.body.async);
+  console.log(`[cmd] #${id} → WS beacon (${command.length} bytes)` + (asyncMode ? ' [async]' : ''));
+  const { resolver, finish } = makeOneShotResolver({
+    id,
+    extendedTimeoutMs: 600000,
+    onTerminate: (payload) => {
+      if (asyncMode) {
+        commandResults.set(id, { ...payload, ts: Date.now() });
+        return;
+      }
+      // Res.json already sent? Express detects via headersSent.
+      if (!res.headersSent) res.json(payload);
+    },
+  });
 
-    try {
-      const result = await new Promise((resolve, reject) => {
-        pendingCommands.set(id, resolve);
+  // Tear down timers if the connecting client (e.g. send_script.py) hangs up
+  // before any beacon response arrives. Only fire on actual client abort —
+  // NOT on clean close (Node fires 'close' when curl finishes sending its
+  // body with Connection: close, which would kill every command prematurely).
+  req.on('close', () => {
+    if (req.aborted) finish({ error: 'Request closed by client', id, timeout: 'client_close' });
+  });
 
-        // Send command to the beacon
-        beaconConnection.send(JSON.stringify({ id, command }));
+  pendingCommands.set(id, resolver);
+  try {
+    beaconConnection.send(JSON.stringify({ id, command }));
+  } catch (err) {
+    return finish({ error: 'Beacon WS send failed: ' + err.message, id });
+  }
 
-        // Set a base timeout (300s) — extended to 600s if beacon sends ack
-        let commandTimedOut = false;
-        const baseTimeout = setTimeout(() => {
-          if (pendingCommands.has(id)) {
-            pendingCommands.delete(id);
-            commandTimedOut = true;
-            resolve({ error: 'Command timed out after 5 minutes', id });
-          }
-        }, 300000);
-
-        // Replace the default resolve with one that handles ack
-        pendingCommands.set(id, (msg) => {
-          if (msg.type === 'ack' && !commandTimedOut) {
-            // Beacon acknowledged — extend timeout to 10 minutes
-            clearTimeout(baseTimeout);
-            setTimeout(() => {
-              if (pendingCommands.has(id)) {
-                pendingCommands.delete(id);
-                commandTimedOut = true;
-                resolve({ error: 'Command timed out after 10 minutes', id });
-              }
-            }, 600000);
-            return;
-          }
-          // Actual result — resolve
-          if (pendingCommands.has(id)) {
-            pendingCommands.delete(id);
-          }
-          clearTimeout(baseTimeout);
-          resolve(msg);
-        });
-      });
-
-      res.json(result);
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
+  if (asyncMode) {
+    return res.json({ id, async: true, note: 'Poll GET /api/beacon/result/' + id + ' for output' });
+  }
 });
 
 // Serve the beacon PowerShell script for easy copy-paste
@@ -218,11 +271,11 @@ app.get('/beacon-script', (req, res) => {
 // ──────────────────────────────────────────────
 // Write a .ps1 script to public/scripts/ and tell the beacon to download & run it.
 // This completely bypasses the bash→curl→JSON→PowerShell escaping nightmare.
+//
+// Supports both a WebSocket beacon (`ws.OPEN`) and HTTP polling beacons
+// (the Python beacon receives `{type: 'script', scriptUrl}` from /api/beacon/poll
+// and downloads + runs the script via Invoke-WebRequest + Invoke-Expression).
 app.post('/api/beacon/script', checkBeaconAuth, async (req, res) => {
-  if (!beaconConnection) {
-    return res.status(503).json({ error: 'No beacon connected.' });
-  }
-
   const scriptContent = req.body.script;
   if (!scriptContent || typeof scriptContent !== 'string') {
     return res.status(400).json({ error: 'Missing "script" in request body' });
@@ -232,61 +285,95 @@ app.post('/api/beacon/script', checkBeaconAuth, async (req, res) => {
   const rawName = (req.body.name || 'cmd_' + Date.now());
   const safeName = rawName.replace(/[^a-zA-Z0-9_-]/g, '_') + '.ps1';
   const scriptsDir = path.join(__dirname, 'public', 'scripts');
-  
-  // Ensure scripts directory exists
-  if (!fs.existsSync(scriptsDir)) {
-    fs.mkdirSync(scriptsDir, { recursive: true });
-  }
-  
+  if (!fs.existsSync(scriptsDir)) fs.mkdirSync(scriptsDir, { recursive: true });
   const scriptPath = path.join(scriptsDir, safeName);
   fs.writeFileSync(scriptPath, scriptContent, 'utf8');
-  
-  // Build the script URL — use tunnel hostname so library PC can reach it
-  const externalHost = getExternalHost();
-  const scriptUrl = 'https://' + externalHost + '/scripts/' + safeName;
-  
-    const id = ++commandIdCounter;
 
+  // Build a script URL the library PC can actually reach.
+  const host = resolvePublicHost(req);
+  const scriptUrl = 'https://' + host + '/scripts/' + safeName;
+  const id = ++commandIdCounter;
+  console.log(`[script] #${id} → ${scriptUrl} (${scriptContent.length} bytes)`);
+
+  const wsAlive = beaconConnection && beaconConnection.readyState === ws.OPEN;
+  const target = req.body.target && httpBeacons.has(req.body.target) ? req.body.target : null;
+
+  // ── WS path ────────────────────────────────────────────────
+  const asyncMode = !!(req.query.async || req.body.async);
+  if (wsAlive && !target) {
+    const { resolver, finish } = makeOneShotResolver({
+      id,
+      extendedTimeoutMs: 600000,
+      onTerminate: (payload) => {
+        if (asyncMode) {
+          commandResults.set(id, { ...payload, ts: Date.now() });
+          return;
+        }
+        if (!res.headersSent) res.json({ scriptUrl, ...payload });
+      },
+    });
+    req.on('close', () => {
+      if (req.aborted) finish({ error: 'Request closed by client', id, timeout: 'client_close' });
+    });
+    pendingCommands.set(id, resolver);
     try {
-      const result = await new Promise((resolve, reject) => {
-        pendingCommands.set(id, resolve);
-
-        // Send scriptUrl to beacon (NO escaping issues — it's just a URL!)
-        beaconConnection.send(JSON.stringify({ id, scriptUrl }));
-
-        let commandTimedOut = false;
-        const baseTimeout = setTimeout(() => {
-          if (pendingCommands.has(id)) {
-            pendingCommands.delete(id);
-            commandTimedOut = true;
-            resolve({ error: 'Script timed out after 5 minutes', id });
-          }
-        }, 300000);
-
-        pendingCommands.set(id, (msg) => {
-          if (msg.type === 'ack' && !commandTimedOut) {
-            clearTimeout(baseTimeout);
-            setTimeout(() => {
-              if (pendingCommands.has(id)) {
-                pendingCommands.delete(id);
-                commandTimedOut = true;
-                resolve({ error: 'Script timed out after 10 minutes', id });
-              }
-            }, 600000);
-            return;
-          }
-          if (pendingCommands.has(id)) {
-            pendingCommands.delete(id);
-          }
-          clearTimeout(baseTimeout);
-          resolve(msg);
-        });
-      });
-
-      res.json({ scriptUrl, ...result });
+      beaconConnection.send(JSON.stringify({ id, scriptUrl }));
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      return finish({ error: 'Beacon WS send failed: ' + err.message, id });
     }
+    if (asyncMode) {
+      return res.json({ id, async: true, scriptUrl, note: 'Poll GET /api/beacon/result/' + id + ' for output' });
+    }
+    return;
+  }
+
+  // ── HTTP polling path ─────────────────────────────────────
+  if (httpBeacons.size > 0) {
+    const beaconId = target || Array.from(httpBeacons.keys())[0];
+    if (!httpBeacons.has(beaconId)) {
+      return res.json({ error: 'Target HTTP beacon not found', beaconIds: Array.from(httpBeacons.keys()), scriptUrl });
+    }
+    const queue = httpCommandQueue.get(beaconId) || [];
+    queue.push({ id, scriptUrl, type: 'script' });
+    httpCommandQueue.set(beaconId, queue);
+    console.log(`[HTTP Beacon] Queued script ${id} for ${beaconId}: ${scriptUrl}`);
+
+    // Poll commandResults for up to 5 minutes (base timeout).
+    const deadline = Date.now() + 300000;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 250));
+      if (commandResults.has(id)) {
+        const r = commandResults.get(id);
+        commandResults.delete(id);
+        return res.json({ scriptUrl, ok: true, ...r });
+      }
+      if (res.headersSent) return;
+    }
+    return res.json({ scriptUrl, error: 'Timed out after 5 minutes waiting for HTTP beacon', id });
+  }
+
+  return res.json({
+    error: 'No live beacon connected (WS not OPEN, no HTTP polling beacon registered). Upload/send via the cloud relay tunnel only works when the library PC has a beacon running.',
+    scriptUrl,
+    id,
+  });
+});
+
+// Admin: drop every pending command/script resolver with an error. Useful when the
+// relay accumulates stuck Promise resolvers after a flaky beacon session.
+app.post('/api/beacon/clear', checkBeaconAuth, (req, res) => {
+  let dropped = 0;
+  for (const [id, resolver] of pendingCommands) {
+    try { resolver({ error: 'Cleared by /api/beacon/clear', id }); } catch (e) {}
+    dropped++;
+  }
+  pendingCommands.clear();
+  // Also drop any HTTP queue entries
+  for (const [beaconId, queue] of httpCommandQueue) {
+    httpCommandQueue.set(beaconId, []);
+  }
+  console.log(`[admin] Cleared ${dropped} pending commands`);
+  res.json({ ok: true, dropped, wsAlive: beaconConnection && beaconConnection.readyState === ws.OPEN, httpBeacons: Array.from(httpBeacons.keys()) });
 });
 
 // ──────────────────────────────────────────────
@@ -311,12 +398,18 @@ app.get('/api/beacon/poll', (req, res) => {
   beacon.lastPoll = Date.now();
   const queue = httpCommandQueue.get(beaconId) || [];
   if (queue.length > 0) {
-    const cmd = queue.shift();
-    beacon.pendingCmd = cmd.id;
-    console.log(`[HTTP Beacon] Sending command ${cmd.id} to ${beaconId}: ${cmd.command?.substring(0, 60)}`);
-    res.json({ command: cmd.command, id: cmd.id });
+    const entry = queue.shift();
+    beacon.pendingCmd = entry.id;
+    if (entry.type === 'script') {
+      console.log(`[HTTP Beacon] Sending script ${entry.id} to ${beaconId}: ${entry.scriptUrl}`);
+      // Distinct JSON shape so the python beacon knows to download+exec
+      res.json({ type: 'script', id: entry.id, scriptUrl: entry.scriptUrl });
+    } else {
+      console.log(`[HTTP Beacon] Sending command ${entry.id} to ${beaconId}: ${entry.command?.substring(0, 60)}`);
+      res.json({ type: 'command', command: entry.command, id: entry.id });
+    }
   } else {
-    res.json({ command: null, id: null });
+    res.json({ type: 'ping', command: null, id: null });
   }
 });
 
@@ -328,20 +421,25 @@ app.post('/api/beacon/ack', (req, res) => {
   res.json({ ok: true });
 });
 
-// POST /api/beacon/result — HTTP beacon submits command result
+// POST /api/beacon/result — HTTP beacon submits command/script result
+// Also accepts {type:"ack"} just like the WebSocket beacon so that
+// /api/beacon/script can extend its timeout without resending HTTP requests.
 app.post('/api/beacon/result', (req, res) => {
-  const { beaconId, id, stdout, stderr, exitCode } = req.body || {};
+  const { beaconId, id, stdout, stderr, exitCode, type } = req.body || {};
   if (!beaconId || !httpBeacons.has(beaconId)) return res.status(404).json({ error: 'beacon not found' });
   const beacon = httpBeacons.get(beaconId);
   beacon.pendingCmd = null;
-  console.log(`[HTTP Beacon] Result: beacon=${beaconId}, id=${id}, exitCode=${exitCode}`);
-  // Resolve any pending promise that was waiting for this command
+  console.log(`[HTTP Beacon] Result: beacon=${beaconId}, id=${id}, type=${type || 'result'}, exitCode=${exitCode}`);
+  // Resolve any pending promise that was waiting for this command.
   if (pendingCommands.has(id)) {
-    pendingCommands.get(id)({ type: 'result', id, stdout, stderr, exitCode });
+    // Fake a WS-shaped message so makeOneShotResolver handles ack/result/error uniformly.
+    const fakeMsg =
+      type === 'ack' ? { type: 'ack', id } :
+      { id, stdout, stderr, exitCode };
+    pendingCommands.get(id)(fakeMsg);
   }
-  // Cache result for later retrieval
+  // Cache result for later retrieval (regardless of pendingCommands)
   commandResults.set(id, { stdout, stderr, exitCode, beaconId, ts: Date.now() });
-  // Keep only last 100 results
   if (commandResults.size > 100) {
     const firstKey = commandResults.keys().next().value;
     commandResults.delete(firstKey);
@@ -1119,7 +1217,7 @@ function getBeaconScript() {
     '    $json = ($data | ConvertTo-Json -Compress -Depth 10)',
     '    $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)',
     '    $seg = New-Object System.ArraySegment[byte] -ArgumentList (,$bytes)',
-    '    $beaconWs.SendAsync($seg, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, [System.Threading.CancellationToken]::None).GetAwaiter().GetResult()',
+    '    $null = $beaconWs.SendAsync($seg, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, [System.Threading.CancellationToken]::None).GetAwaiter().GetResult()',
     '}',
     '',
     '$maxRetries = 10',
@@ -1137,7 +1235,7 @@ function getBeaconScript() {
     '        $beaconWs = New-Object System.Net.WebSockets.ClientWebSocket',
     '        $beaconWs.Options.KeepAliveInterval = [TimeSpan]::FromSeconds(30)',
     '        $uri = [System.Uri]($ServerUrl + "?token=" + $Token)',
-    '        $beaconWs.ConnectAsync($uri, [System.Threading.CancellationToken]::None).GetAwaiter().GetResult()',
+    '        $null = $beaconWs.ConnectAsync($uri, [System.Threading.CancellationToken]::None).GetAwaiter().GetResult()',
     '        $connected = $true',
     '        Write-Host ""',
     '        Write-Host "Connected!" -ForegroundColor Green',
@@ -1154,13 +1252,18 @@ function getBeaconScript() {
     '            if (-not $raw) { break }',
     '            $msg = ($raw | ConvertFrom-Json)',
     '',
-    '            # Handle server keepalive ping',
-    '            if ($msg.type -eq "ping") {',
-    '                Send-Message $beaconWs @{ type = "pong" }',
-    '                continue',
-    '            }',
-    '',
-    '            $response = @{ id = $msg.id }',
+            '            # Handle server keepalive ping',
+            '            if ($msg.type -eq "ping") {',
+            '                Send-Message $beaconWs @{ type = "pong" }',
+            '                continue',
+            '            }',
+            '',
+            '            # Skip messages without id or command (e.g. welcome/connected)',
+            '            if (-not $msg.id -and -not $msg.scriptUrl -and -not $msg.command) {',
+            '                continue',
+            '            }',
+            '',
+            '            $response = @{ id = $msg.id }',
     '',
     '            # Send immediate acknowledgement — keeps Cloudflare tunnel alive during long commands',
     '            Send-Message $beaconWs @{ id = $msg.id; type = "ack" }',
@@ -1168,9 +1271,12 @@ function getBeaconScript() {
     '            try {','                if ($msg.scriptUrl) {',
     '                    Write-Host "Downloading script: $($msg.scriptUrl)" -ForegroundColor Cyan',
     '                    $raw = (Invoke-WebRequest -Uri $msg.scriptUrl -UseBasicParsing).Content; $scriptContent = if ($raw -is [byte[]]) { [System.Text.Encoding]::UTF8.GetString($raw) } else { $raw }',
-    '                    $LASTEXITCODE = 0',
-    '                    $response.stdout = $(Invoke-Expression $scriptContent 2>&1 | Out-String)',
-    '                    $response.exitCode = $LASTEXITCODE',
+    '                    $tmp = [System.IO.Path]::GetTempPath() + [System.IO.Path]::GetRandomFileName() + ".ps1"',
+    '                    [System.IO.File]::WriteAllText($tmp, $scriptContent, [System.Text.Encoding]::UTF8)',
+    '                    try {',
+    '                        $response.stdout = powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tmp 2>&1 | Out-String',
+    '                        $response.exitCode = $LASTEXITCODE',
+    '                    } finally { try { [System.IO.File]::Delete($tmp) } catch {} }',
     '                } elseif ($pythonAvailable -and $msg.command -match "^pywinauto:") {',
     '                    $py = $msg.command -replace "^pywinauto:", ""',
     '                    $LASTEXITCODE = 0',
@@ -1185,7 +1291,7 @@ function getBeaconScript() {
     '            Send-Message $beaconWs $response',
     '        }',
     '        $connected = $false  # trigger reconnect on exit or timeout',
-    '        try { $beaconWs.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "done", [System.Threading.CancellationToken]::None).GetAwaiter().GetResult() } catch {}',
+    '        try { $null = $beaconWs.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "done", [System.Threading.CancellationToken]::None).GetAwaiter().GetResult() } catch {}',
     '    } catch { Write-Host "Connection failed: $_" -ForegroundColor Red; $connected = $false }',
     '    finally { if ($beaconWs) { $beaconWs.Dispose() } }',
     '}',

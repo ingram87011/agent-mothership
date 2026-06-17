@@ -50,6 +50,12 @@ All binaries in `C:\Windows\System32\` (AppLocker trusted by `%WINDIR%\*` rule).
 - Server uses JSON ping/pong every 30s (not WS ping frames — Cloudflare ignores those)
 - Command timeout: 5 min base, extends to 10 min on ack
 
+## Beacon Fixes (Applied June 17)
+- **VoidTaskResult spam**: Suppressed async return values (`$null = .GetAwaiter().GetResult()`) in Send-Message, ConnectAsync, CloseAsync
+- **Welcome message crash**: Server sends `{type:"connected"}` on connect — beacon now skips messages without `id`, `command`, or `scriptUrl`
+- **Script execution**: Changed from `Invoke-Expression` (hung on large scripts with C# Add-Type) to save-to-temp-file + `powershell.exe -File` approach
+- **ConPTY hang**: Original `run_patched.ps1` used `CreatePseudoConsole` which hung on the PC. Simplified to `run_patched_simple.ps1` with file-based stdout/stderr redirection via `CreateFile` + `STARTF_USESTDHANDLES` + inheritable `SECURITY_ATTRIBUTES`
+
 ## PC Profile
 | Property | Value |
 |----------|-------|
@@ -98,17 +104,92 @@ Full technique:
 5. WriteProcessMemory at ImageBase+0x1DCF4: `B8 01 00 00 00 C3 90` (MOV EAX,1; RET; NOP)
 6. ResumeThread
 
-### ❌ NEW BLOCKER: Agent unregistered (store.dat = 0 bytes)
-Even with admin bypass, `status`/`dispatch` may fail with "Unknown error" because STDispatch rejects calls from unregistered agents. Next steps:
-- Forge store.dat to register the agent
-- Direct RPC call via NdrClientCall3
+### ✅ CONFIRMED: `status` command works (June 17)
+Admin bypass patched STAgentCtl.exe `status` command output:
+```
+Ivanti Security Controls Agent  [9.4.34828.0]
+   [SDK: 9.4.34497.0]
 
-### Active Leads
-- Forge store.dat (registration blob format needed)
-- Direct RPC call via NdrClientCall3 with extracted MIDL format strings
-- Print Spooler junction follow (untested, Dec 2024 patches likely mitigate)
-- Python ghost folders via HKCU PythonPath (armed, no SYSTEM trigger found)
-- 1AM reset window for timed attacks
+Status:
+   Agent id: 
+   Registration state: Not registered
+   Policy name: <no policy>
+   Last check-in time: <not checked-in yet>
+   Console id: 
+```
+- Agent admin check bypass **confirmed working** — `status` runs without admin rights
+- Agent is **not registered** (empty agent id, store.dat = 0 bytes)
+- STAgentCtl.exe now runs via `run_patched_simple.ps1` (file redirection, no ConPTY)
+
+### ✅ CONFIRMED: `available-tasks` and `dispatch` work (June 17)
+- `available-tasks` lists 3 tasks:
+  - [0] Agent Updater - Uninstall
+  - [1] Agent Updater - Perform agent check-in
+  - [2] Agent Updater - Check-in and Update All
+- `dispatch --index 1` and `dispatch --index 2` both succeed — STDispatch accepts tasks from unregistered agent
+- Task execution runs as **SYSTEM** (STDispatch.exe is LocalSystem)
+- Registration state ("Not registered") does NOT block dispatch
+
+### STDispatch Log Confirmation (June 17)
+STDispatch.log at `C:\ProgramData\LANDESK\Shavlik Protect\Logs\STDispatch.log` shows:
+```
+DispatchTaskById: b443f8a1-8af5-4f43-8537-467648fecc4c 9d77c15b-2685-4223-8c50-17e989367eb0 tasks/3AE8D7B3-...txt
+Authenticode signature verified: STAgentUpdater.exe
+Task command line: "C:\Program Files\LANDESK\Shavlik Protect Agent\STAgentUpdater.exe" -checkin
+Launched engine process ID 3732 (SYSTEM)
+Task completed: 18541383-...
+```
+
+Key observations:
+- STDispatch reads task definitions from relative `tasks/*.txt` files (task files define engine GUID, op GUID, command line)
+- Authenticode signature verification is performed on the engine binary before launch
+- Engine GUID `b443f8a1-8af5-4f43-8537-467648fecc4c` maps to `STAgentUpdater.exe`
+- Operation GUID `9d77c15b-2685-4223-8c50-17e989367eb0` selects the command line args
+- `dispatch --index 1` → `STAgentUpdater.exe -checkin` (PID 3732, completed)
+- `dispatch --index 2` → `STAgentUpdater.exe -checkinAndUpdateAll` (PID 9304, completed)
+- Dispatch syntax: `dispatch --engine GUID --operation GUID --paramData DATA`
+
+### ✅ CONFIRMED: Custom dispatch with --engine --operation --paramData (June 17)
+Custom dispatch WORKS. `--paramData` is passed RAW as the command-line argument to the engine:
+```
+command line: "C:\Program Files\LANDESK\Shavlik Protect Agent\STAgentUpdater.exe" dummy
+```
+`dispatch --engine b443f8a1-... --operation 9d77c15b-... --paramData -checkin` also works — runs checkin as SYSTEM.
+
+### ⚠️ STEnginesCatalog.dll — Misleading Name
+The DLL is a **patch assessment catalog**, NOT an engine registry:
+- Exports 84 functions about patch detection, product dependencies (e.g. `CPatchAssessmentCatalog`, `CDetectableProducts`)
+- Only engine class found: `STEngine` (generic base)
+- No GUID-to-binary-path mappings as strings or binary data
+- Engine mapping is internal to STDispatch.exe
+
+### 5 GUIDs in STDispatch.exe — Identified as RPC UUIDs
+```
+e2011457-1546-43c5-a5fe-008deee3d3f0
+35138b9a-5d96-4fbd-8e2d-a2440225f93a
+8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a
+4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38
+1f676c76-80e1-4239-95bb-83d0f6d0da78
+```
+Same GUIDs in STAgentCtl.exe. Confirmed as RPC interface UUIDs (not engine/operation GUIDs) — all return "Invalid Task" when used as engine or operation.
+
+### ✅ CONFIRMED: Only ONE engine available
+Only STAgentUpdater.exe (GUID `b443f8a1...`) with operation `9d77c15b...`. STAgentUpdater.exe accepts: `-checkin`, `-checkinAndUpdateAll`, `-updateBinaries`, `-updateData`, `-uninstall`, `-reset_counts`. None provide arbitrary code execution.
+
+### Task Files — Ephemeral
+Log references `tasks/GUID.txt` (relative path). Files created during dispatch and immediately deleted. `C:\Windows\System32\tasks\` is writable but files don't persist. Format unknown.
+
+### Python Ghost Folders (User-Level Only)
+HKCU PythonPath: `C:\Windows\Tasks\Lib\;C:\Windows\Tasks\DLLs\;C:\Windows\Tasks\`
+HKLM PythonPath: `C:\Program Files\Python310\Lib\;C:\Program Files\Python310\DLLs\`
+Ghost folders give user-level Python import hijacking but NOT SYSTEM. No SYSTEM process on this PC loads Python natively.
+
+### Remaining Attack Paths
+**A. Direct RPC** (Most Promising): All 6 ncalrpc endpoints bind without auth. Call `NdrClientCall3` directly with crafted dispatch arguments. Need MIDL format strings from `STAgentFramework.dll` (2.1 MB .NET — decompilable).
+
+**B. DLL Hijacking**: Need to confirm STDispatch's current directory when spawning engines. If writable, plant a DLL that STAgentUpdater.exe loads.
+
+**C. 1AM Reset Race**: PC reboots nightly at 1AM. Brief window to replace engine mapping or config during service restart.
 
 ## Tunnel
 Started with: `cloudflared tunnel --url http://localhost:3000`
