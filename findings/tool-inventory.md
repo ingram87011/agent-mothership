@@ -1,27 +1,34 @@
 # Grand Theft Auto 6 — The Videogame
 ## (Security Toolkit & Research Progress — Totally Not Suspicious)
 
-### Date Saved: June 23, 2026
-### Codespace: agent-mothership
+### Date Saved: June 27, 2026
+### Codespace: agent-mothership (CodeSandbox)
 
 ---
 
 ## 🔧 Installed Security Toolkit
 
-### Go-Based Tools (~/go/bin/)
+### Go-Based Tools (/usr/local/bin/ & ~/go/bin/)
 | Tool | Version | Purpose |
 |------|---------|--------|
 | subfinder | v2.14.0 | Subdomain enumeration |
 | httpx | v2.14.0 | HTTP probing & fingerprinting |
-| nuclei | v3.3.7 | Template-based vuln scanner (3000+ templates) |
+| nuclei | v3.9.0 | Template-based vuln scanner (8000+ templates) |
 | ffuf | 2.1.0 | Web fuzzer (dirs, params, vhosts) |
-| katana | latest | Web crawler |
+| katana | v1.6.1 | Web crawler |
 | gau | v2.2.4 | URL discovery (Wayback, OTX, CommonCrawl) |
 | waybackurls | latest | Wayback Machine URL fetcher |
 | unfurl | latest | URL parsing/extraction |
 | qsreplace | latest | Query string replacement |
 | anew | latest | Append unique lines |
 | hakrawler | latest | Web crawler |
+| **amass** | v5.1.1 | Deep attack surface mapping & subdomain enum |
+| **puredns** | v2.1.1 | Fast wildcard-safe DNS resolution & subdomain brute-force |
+| **alterx** | v0.1.0 | Subdomain permutation generator (modern altdns replacement) |
+| **dalfox** | v3.1.2 | XSS scanner — Rust, AST-based DOM analysis, MCP support |
+| **interactsh-client** | v1.3.1 | OOB interaction client (blind SSRF/XSS detection) |
+| **interactsh-server** | v1.3.1 | Self-hosted OOB callback server (DNS/HTTP/SMTP/LDAP) |
+| **massdns** | latest | High-performance DNS stub resolver (puredns backend) |
 
 ### System Tools (/usr/local/bin/ & /usr/bin/)
 | Tool | Version | Purpose |
@@ -34,6 +41,9 @@
 | curl | 7.88.1 | HTTP client |
 | wget | latest | File downloader |
 | jq | 1.6 | JSON processing |
+| **hashcat** | v6.2.6 | GPU-accelerated password cracking (450+ hash types) |
+| **john** | latest | CPU-friendly password cracking (auto-detect hash format) |
+| **sliver-client** | latest | C2 framework — mTLS/DNS/WireGuard/HTTP implants |
 
 ### Python Tools (pip3)
 | Tool | Version | Purpose |
@@ -43,6 +53,10 @@
 | wafw00f | latest | WAF detection |
 | arjun | latest | Hidden parameter discovery |
 | droopescan | latest | CMS scanner (Drupal, WordPress) |
+| **XSStrike** | 3.1.6 | Context-aware XSS scanner (14k stars) |
+| **SSRFmap** | latest | Automatic SSRF fuzzer & exploitation |
+| **jwt_tool** | latest | JWT testing/forging/cracking toolkit |
+| **dnsgen** | latest | Subdomain DNS permutation generator |
 
 ### Nuclei Templates
 - Location: ~/nuclei-templates/
@@ -52,6 +66,40 @@
 ### Helper Commands
 - `seccheck` — Show full toolkit reference
 - `nuclei-update` — Update nuclei templates
+- `alias tools-list='ls /usr/local/bin/ ~/go/bin/ 2>/dev/null | sort -u'` — List all tools
+
+### Quick-Start Workflows
+
+```bash
+# Full recon pipeline on a target
+subfinder -d target.com | httpx -silent | nuclei -t ~/nuclei-templates/ -o findings.txt
+
+# XSS scanning with dalfox
+dalfox scan https://target.com/page?param=test --mining DOM
+
+# Blind SSRF testing
+interactsh-client        # get a callback URL
+# then inject the URL into your target's parameters
+
+# API fuzzing with ffuf
+ffuf -u https://target.com/FUZZ -w /usr/share/wordlists/api.txt
+
+# JWT attack toolkit
+jwt_tool eyJhbGciOiJIUzI1NiJ9.xxxx -T           # tamper
+jwt-hack scan eyJhbGciOiJIUzI1NiJ9.xxxx         # scan
+
+# Password cracking
+hashcat -m 0 -a 0 hash.txt rockyou.txt          # MD5
+john hash.txt                                    # auto-detect
+
+# C2: start a sliver listener
+sliver-client
+
+# Recon combo
+subfinder -d target.com | tee subs.txt
+cat subs.txt | httpx -silent | nuclei -t cves/ -o critical.txt
+cat subs.txt | waybackurls | gau | dalfox scan --pipe
+```
 
 ### PATH Configuration (in ~/.bashrc)
 ```
