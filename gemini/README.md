@@ -291,6 +291,56 @@ Authenticated access
 
 - To use a real session (avoid guest limitations), run `gemini/cookie-grabber.mjs` in non-headless mode and log in manually to capture auth cookies, update `gemini-bridge.mjs` COOKIES on your local machine, then run `node gemini-bridge.mjs` and expose via `cloudflared tunnel --url http://localhost:5555`.
 
+## Agentic tool layer (Phase 2)
+
+Added on 2026-07-06: server-side agentic layer that allows Gemini to request and run tools (currently: bash) and receive tool outputs back as follow-up context. Purpose: enable the model to call local tools (shell, file readers) when it outputs a special TOOL_CALL JSON object.
+
+How it works
+
+- Detection: the server looks for lines in Gemini's text that match the pattern:
+
+  TOOL_CALL: {"tool":"bash","cmd":"<shell command>"}
+
+  (exact JSON object after the TOOL_CALL: marker)
+
+- Execution: the server runs the requested bash command (via child_process.exec, promisified) and captures stdout/stderr.
+- Feedback loop: the server injects the tool output into a follow-up prompt and calls Gemini again. Up to 3 iterations are permitted to allow multi-step tool usage.
+
+Files changed / location
+
+- gemini/server.mjs — Added agentic loop: detect TOOL_CALL, run bash commands, feed outputs back to Gemini. Logging added to /tmp/gemini-server.log.
+- gemini/gemini-bridge.mjs — parse improvements to assemble incremental fragments.
+- gemini/gemini-tui.mjs — default bridge set to http://localhost:19999 for convenience.
+- ./gemini-chat — launcher script to start server + TUI.
+
+Testing & examples
+
+- Trigger a tool request (example prompt to the proxy):
+
+  curl -s -X POST http://localhost:19999/StreamGenerate \
+    -H "Content-Type: application/json" \
+    -d '{"prompt":"You may request a tool. To request a bash command, reply exactly with:\nTOOL_CALL: {\"tool\":\"bash\",\"cmd\":\"cat /project/workspace/README.md\"}\nNow, request the tool to read the repository README.md."}'
+
+- Direct verification of tool execution (server runs the command itself):
+
+  cat /project/workspace/README.md | sed -n '1,40p'
+
+- Server log (contains detection + tool-run entries):
+
+  tail -f /tmp/gemini-server.log
+
+Security & notes
+
+- The LLM may refuse to read or summarize sensitive or unsafe content; the tool execution still runs but Gemini can decline to process or summarize outputs.
+- Running arbitrary shell commands from an LLM is dangerous; this feature should be restricted and audited in production.
+
+Quick commands
+
+- Start server + TUI: ./gemini-chat
+- Start server only: node gemini/server.mjs > /tmp/gemini-server.log 2>&1 &
+- Start TUI only: node gemini/gemini-tui.mjs
+- Health check: curl -s http://localhost:19999/health
+
 ## References
 
 - Reverse-engineered from Gemini web app (Chrome DevTools network tab)
