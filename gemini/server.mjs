@@ -230,7 +230,12 @@ async function callBridge(prompt) {
 
 // ── Shared: get Gemini response text for a prompt ──
 // Throws { status, msg } on failure. Used by both /StreamGenerate and /v1/messages.
-async function getGeminiText(prompt) {
+import { exec as childExec } from "child_process";
+import { promisify } from "util";
+const exec = promisify(childExec);
+
+async function askOnce(prompt) {
+  console.log(`[server] askOnce prompt preview: ${String(prompt).slice(0,120).replace(/\n/g,' ')}...`);
   if (GEMINI_BRIDGE_URL) {
     const r = await callBridge(prompt);
     if (r.status !== 200 || !r.text) {
@@ -263,8 +268,55 @@ async function getGeminiText(prompt) {
   }
 
   const text = parseGemini(r.body);
-  if (!text) throw { status: 502, msg: "parse failed" };
+  if (!text) {
+    console.error('[server] parseGemini failed. Response snippet:', String(r.body).slice(0,1000).replace(/\n/g,' '));
+    throw { status: 502, msg: "parse failed" };
+  }
   return text;
+}
+
+function detectToolCall(text) {
+  if (!text) return null;
+  // Look for TOOL_CALL: { ... } JSON blob
+  const m = text.match(/TOOL_CALL:\s*(\{[\s\S]*?\})(?:\n|$)/m);
+  if (!m) return null;
+  try { return JSON.parse(m[1]); } catch { return null; }
+}
+
+async function runTool(toolReq) {
+  if (!toolReq || !toolReq.tool) return { ok: false, error: "invalid" };
+  if (toolReq.tool === "bash") {
+    try {
+      const { stdout, stderr } = await exec(toolReq.cmd, { maxBuffer: 10 * 1024 * 1024 });
+      return { ok: true, stdout: stdout.toString(), stderr: stderr ? stderr.toString() : "" };
+    } catch (e) {
+      return { ok: false, stdout: e.stdout ? e.stdout.toString() : "", stderr: e.stderr ? e.stderr.toString() : e.message };
+    }
+  }
+  return { ok: false, error: "unknown tool" };
+}
+
+// Agentic loop: allow Gemini to request tools via special TOOL_CALL JSON. Up to 3 iterations.
+async function getGeminiText(prompt) {
+  let currentPrompt = prompt;
+  for (let iter = 0; iter < 3; iter++) {
+    const text = await askOnce(currentPrompt);
+    // If Gemini produced a tool request, run it and feed result back
+    const toolReq = detectToolCall(text);
+    if (!toolReq) return text;
+
+    console.log(`[server] Detected tool request: ${JSON.stringify(toolReq)}`);
+    console.log(`[server] Running tool: ${toolReq.tool} ${toolReq.cmd}`);
+    const result = await runTool(toolReq);
+    console.log(`[server] Tool result: ok=${result.ok} stdout_len=${result.stdout ? result.stdout.length : 0} stderr_len=${result.stderr ? result.stderr.length : 0} error=${result.error || ''}`);
+    const output = result.ok ? (result.stdout || "(no output)") : (result.error || result.stderr || "(error)");
+
+    // Prepare followup prompt for Gemini with tool output
+    currentPrompt = `Tool invocation result:\nTool request: ${JSON.stringify(toolReq)}\n\nOutput:\n${output}\n\nPlease continue and provide the final answer to the original user request.`;
+    console.log(`[server] Sending followup prompt to Gemini (preview): ${String(currentPrompt).slice(0,120).replace(/\n/g,' ')}...`);
+    // Loop to call Gemini again with the tool output
+  }
+  throw { status: 500, msg: "Tool loop exceeded" };
 }
 
 // ── /StreamGenerate — bridge-compatible API (used by gemini-tui.mjs /direct) ──
