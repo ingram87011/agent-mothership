@@ -6,11 +6,15 @@
   "scripts": {
     "start": "node web-terminal/server.js",
     "web-terminal": "node web-terminal/server.js",
-    "sync": "node session-persistence/sync.js"
+    "sync": "node session-persistence/sync.js",
+    "gemini-chat": "node gemini/gemini-tui.mjs http://localhost:19999"
   },
   "dependencies": {
+    "cloakbrowser": "^0.4.7",
     "express": "^4.18.2",
+    "gemini-reverse": "^2.1.0",
     "node-pty-prebuilt-multiarch": "^0.10.0",
+    "playwright": "^1.61.1",
     "ws": "^8.16.0"
   },
   "keywords": [

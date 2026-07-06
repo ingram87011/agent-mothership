@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# gemini-chat — start local gemini server (background) and launch the TUI connected to it
+# Usage: ./gemini-chat
+
+set -euo pipefail
+
+# Start server if not already running
+if ! pgrep -f "node gemini/server.mjs" >/dev/null 2>&1; then
+  echo "Starting gemini server..."
+  node ./gemini/server.mjs > /tmp/gemini-server.log 2>&1 &
+  sleep 1
+  echo "gemini server started (logs: /tmp/gemini-server.log)"
+else
+  echo "gemini server already running"
+fi
+
+# Launch the TUI connected to the local proxy
+exec node ./gemini/gemini-tui.mjs http://localhost:19999
