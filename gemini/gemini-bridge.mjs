@@ -5,6 +5,7 @@
 
 import http from "http";
 import https from "https";
+import fs from "fs";
 
 const PORT = process.env.BRIDGE_PORT || 5555;
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -71,7 +72,7 @@ function refreshSession() {
 }
 
 // ── Call StreamGenerate ──
-function streamGenerate(prompt) {
+function streamGenerate(prompt, opts = {}) {
   return new Promise((resolve, reject) => {
     if (!FSID) return reject(new Error("No f.sid — bridge not initialized"));
 
@@ -83,8 +84,9 @@ function streamGenerate(prompt) {
       "source-path": "/", hl: "en-US", _reqid: String(Date.now()), rt: "c",
       bl: BL, "f.sid": FSID,
     });
-    // at='' for guest-style, but with real cookies from real IP
-    const path = `/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?${params.toString()}&at=`;
+    // Allow caller to pass an 'at' token to make requests distinct
+    const atToken = opts.at || '';
+    const path = `/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?${params.toString()}&at=${encodeURIComponent(atToken)}`;
 
     const req = https.request({
       hostname: "gemini.google.com", port: 443, path, method: "POST",
@@ -114,7 +116,35 @@ function streamGenerate(prompt) {
 // ── Parse Gemini response ──
 function parseGemini(raw) {
   const clean = raw.replace(/^\)\]\}'\n?/, "");
-  let assembled = "";
+
+  function isNoiseString(s) {
+    if (!s) return true;
+    const t = s.trim();
+    if (!t) return true;
+    if (/^(?:rc|c|r)_[0-9a-f\-]{6,}$/i.test(t)) return true;
+    if (/^[A-Za-z]{1,2}$/.test(t)) return true;
+    if (/^[0-9A-Fa-f]{8,}$/.test(t)) return true;
+    if (/^AwA[A-Za-z0-9_\-]{6,}$/.test(t)) return true;
+    if (/^[^\w\s]+$/.test(t)) return true;
+    return false;
+  }
+
+  function collectText(node, out) {
+    if (node == null) return;
+    if (typeof node === 'string') { const t = node.trim(); if (!isNoiseString(t)) out.push(String(t)); return; }
+    if (Array.isArray(node)) { for (const el of node) collectText(el, out); return; }
+    if (typeof node === 'object') { for (const k of Object.keys(node)) collectText(node[k], out); }
+  }
+
+  function safeFragment(x) {
+    if (typeof x === 'string') return x;
+    if (x === null || x === undefined) return '';
+    if (typeof x === 'object') { try { return JSON.stringify(x); } catch (e) { return String(x); } }
+    return String(x);
+  }
+
+  const fragments = [];
+  const debugEnabled = process.env.DEBUG_GEMINI_RAW === '1';
   for (const line of clean.split("\n")) {
     const t = line.trim();
     if (!t || /^\d+$/.test(t)) continue;
@@ -123,24 +153,75 @@ function parseGemini(raw) {
       const e = Array.isArray(p[0]) ? p[0] : p;
       if (e[0] !== "wrb.fr") continue;
       const d = JSON.parse(e[2]);
-      const candidate = d[4]?.[0]?.[1];
-      let piece = null;
-      if (candidate) {
-        if (Array.isArray(candidate) && typeof candidate[0] === "string") piece = candidate[0];
-        else if (typeof candidate === "string") piece = candidate;
-      }
+      const cand = d?.[4]?.[0]?.[1];
+      const pieces = [];
+      if (cand) collectText(cand, pieces); else collectText(d, pieces);
+      if (pieces.length === 0) continue;
+      const piece = pieces.join(' ').replace(/\s+/g, ' ').trim();
       if (!piece) continue;
-      piece = piece.replace(/\s+/g, " ");
-      if (!assembled) {
-        assembled = piece;
-        continue;
+      const safePiece = safeFragment(piece);
+      fragments.push(safePiece);
+      if (debugEnabled) {
+        try {
+          fs.appendFileSync('/tmp/gemini-raw.log', `LINE: ${line}\nPIECES: ${JSON.stringify(pieces)}\nPIECE_TYPES: ${JSON.stringify(pieces.map(x => typeof x))}\nSAFE_PIECE_TYPE: ${typeof safePiece}\n\n`);
+        } catch (e) { /* ignore logging errors */ }
       }
-      if (piece.includes(assembled)) { assembled = piece; continue; }
-      if (assembled.includes(piece)) continue;
-      assembled = assembled + (assembled.endsWith(" ") || piece.startsWith(" ") ? "" : " ") + piece;
-    } catch {}
+    } catch (err) { continue; }
   }
-  return assembled ? assembled.trim() : null;
+
+  if (fragments.length === 0) return null;
+
+  function mergeJSONFragments(frags) {
+    const out = [];
+    for (let i = 0; i < frags.length; i++) {
+      let f = frags[i];
+      if (typeof f !== 'string') f = safeFragment(f);
+      if (/^[\[{]/.test(f.trim())) {
+        let acc = f;
+        let merged = false;
+        for (let j = i + 1; j < Math.min(frags.length, i + 6); j++) {
+          try { const parsed = JSON.parse(acc); out.push(JSON.stringify(parsed)); i = j - 1; merged = true; break; } catch { acc = acc + ' ' + safeFragment(frags[j]); continue; }
+        }
+        if (!merged) {
+          try { const parsed = JSON.parse(acc); out.push(JSON.stringify(parsed)); i = Math.min(i+5, frags.length-1); continue; } catch {}
+          out.push(safeFragment(f));
+        }
+      } else {
+        const m = f.match(/(\{[\s\S]*\}|\[[\s\S]*\])/);
+        if (m) {
+          try {
+            const parsed = JSON.parse(m[0]);
+            const before = f.slice(0, m.index).trim();
+            const after = f.slice(m.index + m[0].length).trim();
+            if (before) out.push(safeFragment(before));
+            out.push(JSON.stringify(parsed));
+            if (after) out.push(safeFragment(after));
+            continue;
+          } catch {}
+        }
+        out.push(safeFragment(f));
+      }
+    }
+    return out;
+  }
+
+  const mergedFragments = mergeJSONFragments(fragments);
+  if (debugEnabled) {
+    try {
+      fs.appendFileSync('/tmp/gemini-raw.log', `MERGED_FRAGMENTS: ${JSON.stringify(mergedFragments)}\nTYPES: ${JSON.stringify(mergedFragments.map(x => typeof x))}\n\n`);
+    } catch (e) {}
+  }
+
+  const normalizedFragments = mergedFragments.map(safeFragment);
+  let assembled = normalizedFragments[0] || '';
+  for (let i = 1; i < normalizedFragments.length; i++) {
+    const p = normalizedFragments[i];
+    if (!p) continue;
+    if (p.includes(assembled)) { assembled = p; continue; }
+    if (assembled.includes(p)) continue;
+    assembled = assembled + (assembled.endsWith(' ') || p.startsWith(' ') ? '' : ' ') + p;
+  }
+  return assembled.trim();
 }
 
 // ── HTTP Server ──
@@ -168,12 +249,21 @@ const server = http.createServer(async (req, res) => {
         const c = []; req.on("data", d => c.push(d));
         req.on("end", () => resolve(Buffer.concat(c).toString()));
       });
-      const { prompt } = JSON.parse(body);
+      const parsed = JSON.parse(body || '{}');
+      const prompt = parsed.prompt || '';
+      const fresh = parsed.fresh === true || url.searchParams.get('fresh') === '1';
+      const reqId = parsed.req_id || url.searchParams.get('req_id') || String(Date.now());
+
       if (!prompt) { res.writeHead(400).end(JSON.stringify({ error: "no prompt" })); return; }
 
-      if (!FSID) await refreshSession();
+      // If caller requested a fresh/isolated session, refresh session params per-request
+      if (fresh) {
+        await refreshSession();
+      } else if (!FSID) {
+        await refreshSession();
+      }
 
-      const r = await streamGenerate(prompt);
+      const r = await streamGenerate(prompt, { at: reqId });
       if (r.status === 302) {
         res.writeHead(503).end(JSON.stringify({ error: "blocked", detail: "Google redirected to sorry page" }));
         return;

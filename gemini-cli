@@ -35,7 +35,9 @@ else
   echo "[gemini] Proxy already running on :${PROXY_PORT}"
 fi
 
-# Set environment to route Claude Code CLI via local proxy (Bedrock bypass)
+# Set environment to route Claude Code CLI via local proxy (Bedrock mode auth bypass)
+# Bedrock mode sends requests to /model/{id}/invoke-with-response-stream with ZERO auth headers
+# This is the only mode that bypasses the "not logged in" check without a real API key
 export CLAUDE_CODE_USE_BEDROCK=1
 export CLAUDE_CODE_SKIP_BEDROCK_AUTH=1
 export ANTHROPIC_BEDROCK_BASE_URL="http://localhost:${PROXY_PORT}"
@@ -44,6 +46,28 @@ export CLAUDE_CODE_DISABLE_AUTO_UPDATES=1
 # Export origin IP for downstream visibility
 export ANTHROPIC_ORIGIN_IP="160.79.104.10"
 
+# If ANTHROPIC_API_KEY is set, enable origin mode (bypass Cloudflare → direct Anthropic API)
+if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+  export ANTHROPIC_ORIGIN_MODE=1
+  echo "[gemini] Origin mode enabled — Anthropic API via 160.79.104.10 (Cloudflare bypass)"
+fi
+
 # Launch Claude Code CLI
+# If user didn't provide --model, default to gemini-3.5-flash so the CLI displays Gemini
+MODEL_ARG=""
+for a in "$@"; do
+  case "$a" in
+    --model|-m)
+      MODEL_ARG=""; break;;
+    --model=*)
+      MODEL_ARG=""; break;;
+  esac
+done
+if [ -z "$MODEL_ARG" ]; then
+  # Prepend default model
+  MODEL_ARG="--model gemini-3.5-flash"
+fi
+
 echo "[gemini] Launching Claude CLI connected to local proxy @ http://localhost:${PROXY_PORT} (origin IP: ${ANTHROPIC_ORIGIN_IP})"
-exec claude "$@"
+# Exec claude CLI with model override if needed
+exec claude $MODEL_ARG "$@"
