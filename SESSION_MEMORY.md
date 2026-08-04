@@ -455,3 +455,18 @@ Claude Code CLI (Bedrock mode)
 ## Restart Note
 
 The user deliberately restarted to activate plugins. Next session: verify both plugins loaded (skill tool lists superpowers skills, headroom_retrieve tool available), then continue with whatever task is next.
+
+## 🆕 Gemini Web Proxy (port 19998) — tools/ stack (July 4)
+
+Claude Code CLI → ANTHROPIC_BASE_URL=http://localhost:19998 → tools/gemini-proxy.js → gemini.google.com StreamGenerate
+
+| File | Purpose |
+|------|---------|
+| `tools/gem.sh` | One-shot launcher: harvest if needed + start proxy (19998) + exec claude |
+| `tools/gemini-proxy.js` | Gemini web API → Anthropic Messages API proxy (port 19998) |
+| `tools/gemini_harvest.py` | Playwright session harvester → /tmp/gemini_session.json |
+| `tools/gemini-agent.js` | Self-contained agent loop (bash/read/write blocks, 25 turns) |
+| `tools/claude-hack/proxy.js` | Claude web API proxy (port 19997, origin IP) |
+| `findings/session-gemini-api-breakthrough.md` | Gemini StreamGenerate reverse-engineering notes |
+
+Commands: `bash tools/gem.sh` (interactive) or `ANTHROPIC_BASE_URL=http://localhost:19998 ANTHROPIC_API_KEY=test claude`
